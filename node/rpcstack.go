@@ -29,7 +29,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/MaxeASN/nitro/privacy"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/rs/cors"
@@ -382,8 +381,7 @@ func NewHTTPHandlerStack(srv http.Handler, cors []string, vhosts []string, jwtSe
 	if len(jwtSecret) != 0 {
 		handler = newJWTHandler(jwtSecret, handler)
 	}
-	//return newGzipHandler(handler)
-	return privacy.RpcResponseMiddleware(newGzipHandler(handler))
+	return newGzipHandler(privacy.RpcResponseMiddleware(handler))
 }
 
 // NewWSHandlerStack returns a wrapped ws-related handler.
