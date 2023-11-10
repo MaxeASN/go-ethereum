@@ -144,6 +144,9 @@ type CacheConfig struct {
 	TriesInMemory uint64        // Height difference before which a trie may not be garbage-collected
 	TrieRetention time.Duration // Time limit before which a trie may not be garbage-collected
 
+	MaxNumberOfBlocksToSkipStateSaving uint32
+	MaxAmountOfGasToSkipStateSaving    uint64
+
 	SnapshotNoBuild bool // Whether the background generation is allowed
 	SnapshotWait    bool // Wait for snapshot construction on startup. TODO(karalabe): This is a dirty hack for testing, nuke it
 }
@@ -153,8 +156,10 @@ type CacheConfig struct {
 var defaultCacheConfig = &CacheConfig{
 
 	// Arbitrum Config Options
-	TriesInMemory: DefaultTriesInMemory,
-	TrieRetention: 30 * time.Minute,
+	TriesInMemory:                      DefaultTriesInMemory,
+	TrieRetention:                      30 * time.Minute,
+	MaxNumberOfBlocksToSkipStateSaving: 0,
+	MaxAmountOfGasToSkipStateSaving:    0,
 
 	TrieCleanLimit: 256,
 	TrieDirtyLimit: 256,
@@ -236,6 +241,9 @@ type BlockChain struct {
 	processor  Processor // Block transaction processor interface
 	forker     *ForkChoice
 	vmConfig   vm.Config
+
+	numberOfBlocksToSkipStateSaving      uint32
+	amountOfGasInBlocksToSkipStateSaving uint64
 }
 
 type trieGcEntry struct {
@@ -1031,15 +1039,15 @@ func (bc *BlockChain) Stop() {
 		triedb := bc.triedb
 
 		for _, offset := range []uint64{0, 1, bc.cacheConfig.TriesInMemory - 1, math.MaxUint64} {
-			if number := bc.CurrentBlock().Number.Uint64(); number > offset {
+			if number := bc.CurrentBlock().Number.Uint64(); number > offset || offset == math.MaxUint64 {
 				var recent *types.Block
-				if offset == math.MaxUint {
+				if offset == math.MaxUint64 && !bc.triegc.Empty() {
 					_, latest := bc.triegc.Peek()
 					recent = bc.GetBlockByNumber(uint64(-latest))
 				} else {
 					recent = bc.GetBlockByNumber(number - offset)
 				}
-				if recent.Root() == (common.Hash{}) {
+				if recent == nil || recent.Root() == (common.Hash{}) {
 					continue
 				}
 
@@ -1439,12 +1447,38 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 	if err != nil {
 		return err
 	}
-	// If we're running an archive node, always flush
-	if bc.cacheConfig.TrieDirtyDisabled {
-		return bc.triedb.Commit(root, false)
+	// If we're running an archive node, flush
+	// If MaxNumberOfBlocksToSkipStateSaving or MaxAmountOfGasToSkipStateSaving is not zero, then flushing of some blocks will be skipped:
+	// * at most MaxNumberOfBlocksToSkipStateSaving block state commits will be skipped
+	// * sum of gas used in skipped blocks will be at most MaxAmountOfGasToSkipStateSaving
+	archiveNode := bc.cacheConfig.TrieDirtyDisabled
+	if archiveNode {
+		var maySkipCommiting, blockLimitReached, gasLimitReached bool
+		if bc.cacheConfig.MaxNumberOfBlocksToSkipStateSaving != 0 {
+			maySkipCommiting = true
+			if bc.numberOfBlocksToSkipStateSaving > 0 {
+				bc.numberOfBlocksToSkipStateSaving--
+			} else {
+				blockLimitReached = true
+			}
+		}
+		if bc.cacheConfig.MaxAmountOfGasToSkipStateSaving != 0 {
+			maySkipCommiting = true
+			if bc.amountOfGasInBlocksToSkipStateSaving >= block.GasUsed() {
+				bc.amountOfGasInBlocksToSkipStateSaving -= block.GasUsed()
+			} else {
+				gasLimitReached = true
+			}
+		}
+		if !maySkipCommiting || blockLimitReached || gasLimitReached {
+			bc.numberOfBlocksToSkipStateSaving = bc.cacheConfig.MaxNumberOfBlocksToSkipStateSaving
+			bc.amountOfGasInBlocksToSkipStateSaving = bc.cacheConfig.MaxAmountOfGasToSkipStateSaving
+			return bc.triedb.Commit(root, false)
+		}
+		// we are skipping saving the trie to diskdb, so we need to keep the trie in memory and garbage collect it later
 	}
 
-	// Full but not archive node, do proper garbage collection
+	// Full node or archive node that's not keeping all states, do proper garbage collection
 	bc.triedb.Reference(root, common.Hash{}) // metadata reference to keep trie alive
 	bc.triegc.Push(trieGcEntry{root, block.Header().Time}, -int64(block.NumberU64()))
 
@@ -1477,7 +1511,8 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 		}
 		flushInterval := time.Duration(bc.flushInterval.Load())
 		// If we exceeded out time allowance, flush an entire trie to disk
-		if bc.gcproc > flushInterval && prevEntry != nil {
+		// In case of archive node that skips some trie commits we don't flush tries here
+		if bc.gcproc > flushInterval && prevEntry != nil && !archiveNode {
 			// If the header is missing (canonical chain behind), we're reorging a low
 			// diff sidechain. Suspend committing until this operation is completed.
 			header := bc.GetHeaderByNumber(prevNum)
